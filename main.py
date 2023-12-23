@@ -24,6 +24,7 @@ def seed_initialization(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
 
 
 def make_dir(path):
@@ -56,11 +57,11 @@ def wrap_env(env_id, render = False):
 def GAE(values, rewards, dones, gamma, gae_lambda, notend_game, next_value):
     advantages =torch.zeros_like(rewards)
     delta = torch.zeros_like(rewards)
-    batch_size = rewards.shape[0]
+    num_steps = rewards.shape[0]
     with torch.no_grad():
-        delta[-1] = rewards[-1] + gamma * next_value * (1 - notend_game) - values[-1]
+        delta[-1] = rewards[-1] + gamma * next_value * notend_game - values[-1]
         advantages[-1] = delta[-1]
-        for t in reversed(range(batch_size - 1)):
+        for t in reversed(range(num_steps - 1)):
             delta[t] = rewards[t] + gamma * next_value * (1 - dones[t + 1]) - values[t]
             advantages[t] = delta[t] + gamma * gae_lambda * (1 - dones[t + 1]) * advantages[t + 1]
         returns = advantages + values
@@ -69,7 +70,7 @@ def GAE(values, rewards, dones, gamma, gae_lambda, notend_game, next_value):
 
 # Training Loop
 def train_ppo(agent, device, run_name, total_timesteps, seed, num_steps, num_envs, minibatches, learning_rate, anneal_lr=True, gamma=0.99,
-              gae_lambda=0.95, clip_eps=0.1, max_grad_norm = 0.5, ent_coef=0.01, vf_coef=0.5, clip_threshold=0.1, record_info=True):
+              update_epochs=4, gae_lambda=0.95, clip_eps=0.1, max_grad_norm = 0.5, ent_coef=0.01, vf_coef=0.5, clip_threshold=0.1, record_info=True):
     start_time = time.time()
     if record_info:
         writer = SummaryWriter(f"runs/{run_name}")
@@ -77,11 +78,10 @@ def train_ppo(agent, device, run_name, total_timesteps, seed, num_steps, num_env
             "hyperparameters",
             f"gamma: {gamma}|gae_lambda: {gae_lambda}| clip_eps: {clip_eps}|max_grad_norm: {max_grad_norm}|ent_coef: {ent_coef}|vf_coef: {vf_coef}|\
                 total_timesteps: {total_timesteps}| num_steps:{num_steps}| num_envs: {learning_rate}| minibatches: {minibatches}| learning_rate: {learning_rate}|\
-                clip_threshold: {clip_threshold}",
+                clip_threshold: {clip_threshold}| update_epochs: {update_epochs}",
         )
     optimizer = optim.Adam(agent.parameters(), lr=learning_rate, eps=1e-5)
     envs = agent.envs
-    torch.backends.cudnn.deterministic = True
 
     batch_size = num_envs * num_steps
     num_iterations = total_timesteps // batch_size
@@ -96,15 +96,17 @@ def train_ppo(agent, device, run_name, total_timesteps, seed, num_steps, num_env
     dones = torch.zeros((num_steps, num_envs)).to(device)
     values = torch.zeros((num_steps, num_envs)).to(device)
 
+    state, _ = envs.reset(seed=seed)
+    next_ob = torch.Tensor(state).to(device)
+    next_done = torch.zeros(num_envs).to(device)
+
     for iteration in range(1, num_iterations + 1):
         if anneal_lr:
             frac = 1.0 - (iteration - 1.0) / num_iterations  # learning rate will be decreased
             lrnow = frac * learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
-        state, _ = envs.reset(seed=seed)
-        next_ob = torch.Tensor(state).to(device)
-        next_done = torch.zeros(num_envs).to(device)
-        for k in range(0, num_steps):  # Collect the data
+        # collect the date
+        for k in range(0, num_steps):
             train_step = train_step + num_envs
             obs[k] = next_ob
             dones[k] = next_done
@@ -140,7 +142,7 @@ def train_ppo(agent, device, run_name, total_timesteps, seed, num_steps, num_env
         batch_returns = returns.reshape(-1)
         batch_values = values.reshape(-1)
 
-        for epoch in range(minibatches):
+        for epoch in range(update_epochs):
             np.random.shuffle(inds)
             for start_ind in range(0, batch_size, minibatchsize):
                 end_ind = start_ind + minibatchsize
@@ -221,7 +223,7 @@ if __name__ == "__main__":
     )
     agent = Agent(envs).to(device)
 
-    total_timesteps = 25600
+    total_timesteps = 128000
     today = datetime.datetime.today()
     run_name = f"{env_id}_{seed}_{today.day}_{datetime.datetime.now().hour}h{datetime.datetime.now().minute}m_{total_timesteps}"
     num_steps = 128
