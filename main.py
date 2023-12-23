@@ -75,7 +75,8 @@ def train_ppo(agent, device, run_name, total_timesteps, seed, num_steps, num_env
         writer = SummaryWriter(f"runs/{run_name}")
         writer.add_text(
             "hyperparameters",
-            f"gae_lambda: {gae_lambda}| clip_eps: {clip_eps}|max_grad_norm: {max_grad_norm}|ent_coef: {ent_coef}|vf_coef: {vf_coef}|\
+            f"gamma: {gamma}|gae_lambda: {gae_lambda}| clip_eps: {clip_eps}|max_grad_norm: {max_grad_norm}|ent_coef: {ent_coef}|vf_coef: {vf_coef}|\
+                total_timesteps: {total_timesteps}| num_steps:{num_steps}| num_envs: {learning_rate}| minibatches: {minibatches}| learning_rate: {learning_rate}|\
                 clip_threshold: {clip_threshold}",
         )
     optimizer = optim.Adam(agent.parameters(), lr=learning_rate, eps=1e-5)
