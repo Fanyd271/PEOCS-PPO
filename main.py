@@ -1,0 +1,230 @@
+import random
+import os
+import datetime
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import numpy as np
+from PPO import Agent
+import gymnasium as gym
+import time
+from torch.distributions.categorical import Categorical
+from stable_baselines3.common.atari_wrappers import (
+    ClipRewardEnv,
+    EpisodicLifeEnv,
+    FireResetEnv,
+    MaxAndSkipEnv,
+    NoopResetEnv,
+)
+from torch.utils.tensorboard import SummaryWriter
+
+
+def seed_initialization(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def make_dir(path):
+    if not os.path.exists(path):
+        os.makedirs(path)
+
+
+# PPO Neural Network Model
+def wrap_env(env_id, render = False):
+    def inner():
+        if render:
+            env = gym.make(env_id, render_mode="human")
+        else:
+            env = gym.make(env_id)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        env = NoopResetEnv(env, noop_max=30) # random initialization
+        env = MaxAndSkipEnv(env, skip=4) # frameskipping
+        env = EpisodicLifeEnv(env) # mark the end of game
+        if "FIRE" in env.unwrapped.get_action_meanings():
+            env = FireResetEnv(env) # details about the game
+        env = ClipRewardEnv(env) # renormalize the reward for skipped frames 
+        env = gym.wrappers.ResizeObservation(env, (84, 84)) # suggested in DQN papers
+        env = gym.wrappers.GrayScaleObservation(env)
+        env = gym.wrappers.FrameStack(env, 4) # help identify the velocity
+        return env
+    return inner
+
+
+# Generalized advantage estimation
+def GAE(values, rewards, dones, gamma, gae_lambda, notend_game, next_value):
+    advantages =torch.zeros_like(rewards)
+    delta = torch.zeros_like(rewards)
+    batch_size = rewards.shape[0]
+    with torch.no_grad():
+        delta[-1] = rewards[-1] + gamma * next_value * (1 - notend_game) - values[-1]
+        advantages[-1] = delta[-1]
+        for t in reversed(range(batch_size - 1)):
+            delta[t] = rewards[t] + gamma * next_value * (1 - dones[t + 1]) - values[t]
+            advantages[t] = delta[t] + gamma * gae_lambda * (1 - dones[t + 1]) * advantages[t + 1]
+        returns = advantages + values
+    return advantages, returns
+
+
+# Training Loop
+def train_ppo(agent, device, run_name, total_timesteps, seed, num_steps, num_envs, minibatches, learning_rate, anneal_lr=True, gamma=0.99,
+              gae_lambda=0.95, clip_eps=0.1, max_grad_norm = 0.5, ent_coef=0.01, vf_coef=0.5, clip_threshold=0.1, record_info=True):
+    start_time = time.time()
+    if record_info:
+        writer = SummaryWriter(f"runs/{run_name}")
+        writer.add_text(
+            "hyperparameters",
+            f"gae_lambda: {gae_lambda}| clip_eps: {clip_eps}|max_grad_norm: {max_grad_norm}|ent_coef: {ent_coef}|vf_coef: {vf_coef}|\
+                clip_threshold: {clip_threshold}",
+        )
+    optimizer = optim.Adam(agent.parameters(), lr=learning_rate, eps=1e-5)
+    envs = agent.envs
+    torch.backends.cudnn.deterministic = True
+
+    batch_size = num_envs * num_steps
+    num_iterations = total_timesteps // batch_size
+    train_step = 0
+    current_return = -20
+
+    # Initialize the stroage space
+    obs = torch.zeros((num_steps, num_envs) + envs.single_observation_space.shape).to(device)
+    actions = torch.zeros((num_steps, num_envs)+ envs.single_action_space.shape).to(device)
+    logprobs = torch.zeros((num_steps, num_envs)).to(device)
+    rewards = torch.zeros((num_steps, num_envs)).to(device)
+    dones = torch.zeros((num_steps, num_envs)).to(device)
+    values = torch.zeros((num_steps, num_envs)).to(device)
+
+    for iteration in range(1, num_iterations + 1):
+        if anneal_lr:
+            frac = 1.0 - (iteration - 1.0) / num_iterations  # learning rate will be decreased
+            lrnow = frac * learning_rate
+            optimizer.param_groups[0]["lr"] = lrnow
+        state, _ = envs.reset(seed=seed)
+        next_ob = torch.Tensor(state).to(device)
+        next_done = torch.zeros(num_envs).to(device)
+        for k in range(0, num_steps):  # Collect the data
+            train_step = train_step + num_envs
+            obs[k] = next_ob
+            dones[k] = next_done
+            with torch.no_grad():
+                action, logprob, _, value = agent.get_action_and_value(next_ob)
+                values[k] = value.flatten()
+                actions[k] = action
+                logprobs[k] = logprob
+            next_ob, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
+            rewards[k] = torch.tensor(reward).to(device)
+            next_done = np.logical_or(terminations, truncations)
+            next_ob, next_done = torch.Tensor(next_ob).to(device), torch.Tensor(next_done).to(device)
+
+            if record_info and "final_info" in infos:
+                for info in infos["final_info"]:
+                    if info and "episode" in info:
+                        # print(f"train_step={train_step}, episodic_return={info['episode']['r']}")
+                        current_return = info["episode"]["r"]
+                        writer.add_scalar("charts/episodic_return", info["episode"]["r"], train_step)
+                        writer.add_scalar("charts/episodic_length", info["episode"]["l"], train_step)
+        notend_game = 1 - next_done # whether the game ends
+        next_value = agent.get_value(next_ob).reshape(1, -1)
+        advantages, returns = GAE(values, rewards, dones, gamma, gae_lambda, notend_game, next_value)
+        # train the network
+        inds = np.arange(batch_size)
+        minibatchsize = batch_size // minibatches
+
+        # flatten the batch to form the right batch size 
+        batch_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
+        batch_logprobs = logprobs.reshape(-1)
+        batch_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+        batch_advantages = advantages.reshape(-1)
+        batch_returns = returns.reshape(-1)
+        batch_values = values.reshape(-1)
+
+        for epoch in range(minibatches):
+            np.random.shuffle(inds)
+            for start_ind in range(0, batch_size, minibatchsize):
+                end_ind = start_ind + minibatchsize
+                selected_inds = inds[start_ind:end_ind]
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(batch_obs[selected_inds], batch_actions.long()[selected_inds])
+                logratio = newlogprob - batch_logprobs[selected_inds]
+                ratio = logratio.exp()
+
+                norm_adavantages = batch_advantages[selected_inds]
+                norm_adavantages = (norm_adavantages - norm_adavantages.mean())/(norm_adavantages.std() + 1e-8)
+
+                sur_loss1 = -norm_adavantages * ratio
+                sur_loss2 = -norm_adavantages * torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
+                sur_loss = torch.max(sur_loss1, sur_loss2).mean()
+                # clip the loss, recommended techiniques 
+                newvalue = newvalue.view(-1)
+                v_loss_unclipped = (newvalue - batch_returns[selected_inds]) ** 2
+                newvalue_clipped = torch.clamp(newvalue, 
+                    batch_values[selected_inds] - clip_threshold, batch_values[selected_inds] + clip_threshold)
+                v_loss_clipped = (newvalue_clipped - batch_returns[selected_inds]) ** 2
+                v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
+                v_loss = 0.5 * v_loss_max.mean()
+                # entropy loss
+                entropy_loss = entropy.mean()
+
+                loss = sur_loss + vf_coef * v_loss - ent_coef * entropy_loss
+
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
+                optimizer.step()
+        if iteration % 5 ==0:
+            print(f"Iter: {iteration}/{num_iterations} | SPS: {int(train_step / (time.time() - start_time))} | Episodic return: {int(current_return)}")
+        if record_info:
+            writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], train_step)
+            writer.add_scalar("losses/value_loss", v_loss.item(), train_step)
+            writer.add_scalar("losses/policy_loss", sur_loss.item(), train_step)
+            writer.add_scalar("losses/entropy", entropy_loss.item(), train_step)
+            writer.add_scalar("charts/SPS", int(train_step / (time.time() - start_time)), train_step)
+    envs.close()
+    if record_info:
+        make_dir("model/"+run_name)
+        torch.save(agent.actor.state_dict(), "./model/"+run_name+"/Actor.pth")
+        torch.save(agent.critic.state_dict(), "./model/"+run_name+"/Critic.pth")
+        torch.save(agent.network.state_dict(), "./model/"+run_name+"/Network.pth")
+
+
+def test(agent, device, env_id, path, episodes):
+    print("--------Start testing-----------")
+    env = wrap_env(env_id, render=True)()
+    agent = Agent(env).to(device)
+    agent.actor.load_state_dict(torch.load("./model/"+path+"/Actor.pth"))
+    agent.critic.load_state_dict(torch.load("./model/"+path+"/Critic.pth"))
+    agent.network.load_state_dict(torch.load("./model/"+path+"/Network.pth"))
+    for _ in range(episodes):
+        state = agent.envs.reset() 
+        next_ob = torch.Tensor(state[0]).to(device).unsqueeze(0)
+        done = False
+
+        while not done:
+            action, _, _, _ = agent.get_action_and_value(next_ob) 
+            next_ob, _, terminations, truncations, info = agent.envs.step(action[0].cpu().numpy())
+            next_ob = torch.Tensor(next_ob).to(device).unsqueeze(0)
+            done = np.logical_or(terminations, truncations)
+            if done == True:
+                print("Episodic reward: %10.3f|Episodic length: %10.3f" % (info["episode"]["r"], info["episode"]["l"]))
+
+
+if __name__ == "__main__":
+    seed = 1
+    seed_initialization(seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    env_id = "PongNoFrameskip-v4"
+    num_envs = 4
+    envs = gym.vector.SyncVectorEnv(
+        [wrap_env(env_id) for _ in range(num_envs)]
+    )
+    agent = Agent(envs).to(device)
+
+    total_timesteps = 25600
+    today = datetime.datetime.today()
+    run_name = f"{env_id}_{seed}_{today.day}_{datetime.datetime.now().hour}h{datetime.datetime.now().minute}m_{total_timesteps}"
+    num_steps = 128
+    minibatches = 4
+    learning_rate = 2.5e-4
+    train_ppo(agent, device, run_name, total_timesteps, seed, num_steps, num_envs, minibatches, learning_rate)
+    test(agent, device, env_id, run_name, 1)
