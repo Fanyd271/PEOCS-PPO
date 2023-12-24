@@ -54,15 +54,16 @@ def wrap_env(env_id, render = False):
 
 
 # Generalized advantage estimation
-def GAE(values, rewards, dones, gamma, gae_lambda, notend_game, next_value):
-    advantages =torch.zeros_like(rewards)
-    delta = torch.zeros_like(rewards)
+def GAE(agent, values, rewards, dones, gamma, gae_lambda, notend_game, next_ob):
     num_steps = rewards.shape[0]
     with torch.no_grad():
+        advantages =torch.zeros_like(rewards)
+        delta = torch.zeros_like(rewards)
+        next_value = agent.get_value(next_ob).reshape(1, -1)
         delta[-1] = rewards[-1] + gamma * next_value * notend_game - values[-1]
         advantages[-1] = delta[-1]
         for t in reversed(range(num_steps - 1)):
-            delta[t] = rewards[t] + gamma * next_value * (1 - dones[t + 1]) - values[t]
+            delta[t] = rewards[t] + gamma * values[t + 1] * (1 - dones[t + 1]) - values[t]
             advantages[t] = delta[t] + gamma * gae_lambda * (1 - dones[t + 1]) * advantages[t + 1]
         returns = advantages + values
     return advantages, returns
@@ -83,8 +84,8 @@ def train_ppo(agent, device, run_name, total_timesteps, seed, num_steps, num_env
     optimizer = optim.Adam(agent.parameters(), lr=learning_rate, eps=1e-5)
     envs = agent.envs
 
-    batch_size = num_envs * num_steps
-    num_iterations = total_timesteps // batch_size
+    batch_size = int(num_envs * num_steps)
+    num_iterations = int(total_timesteps // batch_size)
     train_step = 0
     current_return = -20
 
@@ -115,6 +116,7 @@ def train_ppo(agent, device, run_name, total_timesteps, seed, num_steps, num_env
                 values[k] = value.flatten()
                 actions[k] = action
                 logprobs[k] = logprob
+            # train
             next_ob, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
             rewards[k] = torch.tensor(reward).to(device)
             next_done = np.logical_or(terminations, truncations)
@@ -128,8 +130,7 @@ def train_ppo(agent, device, run_name, total_timesteps, seed, num_steps, num_env
                         writer.add_scalar("charts/episodic_return", info["episode"]["r"], train_step)
                         writer.add_scalar("charts/episodic_length", info["episode"]["l"], train_step)
         notend_game = 1 - next_done # whether the game ends
-        next_value = agent.get_value(next_ob).reshape(1, -1)
-        advantages, returns = GAE(values, rewards, dones, gamma, gae_lambda, notend_game, next_value)
+        advantages, returns = GAE(agent, values, rewards, dones, gamma, gae_lambda, notend_game, next_ob)
         # train the network
         inds = np.arange(batch_size)
         minibatchsize = batch_size // minibatches
@@ -153,11 +154,11 @@ def train_ppo(agent, device, run_name, total_timesteps, seed, num_steps, num_env
 
                 norm_adavantages = batch_advantages[selected_inds]
                 norm_adavantages = (norm_adavantages - norm_adavantages.mean())/(norm_adavantages.std() + 1e-8)
-
+                # clip the surrogate loss
                 sur_loss1 = -norm_adavantages * ratio
                 sur_loss2 = -norm_adavantages * torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
                 sur_loss = torch.max(sur_loss1, sur_loss2).mean()
-                # clip the loss, recommended techiniques 
+                # clip the value loss, recommended techiniques in the paper
                 newvalue = newvalue.view(-1)
                 v_loss_unclipped = (newvalue - batch_returns[selected_inds]) ** 2
                 newvalue_clipped = torch.clamp(newvalue, 
@@ -175,7 +176,9 @@ def train_ppo(agent, device, run_name, total_timesteps, seed, num_steps, num_env
                 nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
                 optimizer.step()
         if iteration % 5 ==0:
-            print(f"Iter: {iteration}/{num_iterations} | SPS: {int(train_step / (time.time() - start_time))} | Episodic return: {int(current_return)}")
+            remain_step = total_timesteps-train_step
+            SPS = train_step / (time.time() - start_time)
+            print(f"Iter: {iteration}/{num_iterations} | SPS: {int(SPS)} | Episodic return: {int(current_return)} | Remaining time: {int(remain_step/(SPS*3600))}h {int(((remain_step/SPS)%3600)/60)}m")
         if record_info:
             writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], train_step)
             writer.add_scalar("losses/value_loss", v_loss.item(), train_step)
@@ -190,7 +193,7 @@ def train_ppo(agent, device, run_name, total_timesteps, seed, num_steps, num_env
         torch.save(agent.network.state_dict(), "./model/"+run_name+"/Network.pth")
 
 
-def test(agent, device, env_id, path, episodes):
+def test(device, env_id, path, episodes):
     print("--------Start testing-----------")
     env = wrap_env(env_id, render=True)()
     agent = Agent(env).to(device)
@@ -217,17 +220,21 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     env_id = "PongNoFrameskip-v4"
-    num_envs = 4
+    num_envs = 8
     envs = gym.vector.SyncVectorEnv(
         [wrap_env(env_id) for _ in range(num_envs)]
     )
     agent = Agent(envs).to(device)
 
-    total_timesteps = 128000
+    total_timesteps = 20000000 # 20M
     today = datetime.datetime.today()
     run_name = f"{env_id}_{seed}_{today.day}_{datetime.datetime.now().hour}h{datetime.datetime.now().minute}m_{total_timesteps}"
     num_steps = 128
     minibatches = 4
     learning_rate = 2.5e-4
-    train_ppo(agent, device, run_name, total_timesteps, seed, num_steps, num_envs, minibatches, learning_rate)
-    test(agent, device, env_id, run_name, 1)
+    train_ppo(agent, device, run_name, total_timesteps, seed, num_steps, num_envs, minibatches, learning_rate,
+              record_info=True, anneal_lr=True)
+    
+    # test the model
+    # run_name = f"{env_id}_{1}_{today.day}_{10}h{14}m_{total_timesteps}"
+    # test(device, env_id, run_name, 1)
