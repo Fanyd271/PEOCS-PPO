@@ -33,12 +33,17 @@ def make_dir(path):
 
 
 # PPO Neural Network Model
-def wrap_env(env_id, render = False):
+def wrap_env(env_id, *args, render=False, capture_video=False):
     def inner():
         if render:
             env = gym.make(env_id, render_mode="human")
         else:
-            env = gym.make(env_id)
+            env = gym.make(env_id, render_mode='rgb_array')
+        if capture_video:
+            if render:
+                print("The gym wrapper only allows to either render or record video.")
+            else:
+                env = gym.wrappers.RecordVideo(env, f"videos/{args[0]}")
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = NoopResetEnv(env, noop_max=30) # random initialization
         env = MaxAndSkipEnv(env, skip=4) # frameskipping
@@ -122,13 +127,13 @@ def train_ppo(agent, device, run_name, total_timesteps, seed, num_steps, num_env
             next_done = np.logical_or(terminations, truncations)
             next_ob, next_done = torch.Tensor(next_ob).to(device), torch.Tensor(next_done).to(device)
 
-            if record_info and "final_info" in infos:
+            if "final_info" in infos:
                 for info in infos["final_info"]:
                     if info and "episode" in info:
-                        # print(f"train_step={train_step}, episodic_return={info['episode']['r']}")
                         current_return = info["episode"]["r"]
-                        writer.add_scalar("charts/episodic_return", info["episode"]["r"], train_step)
-                        writer.add_scalar("charts/episodic_length", info["episode"]["l"], train_step)
+                        if record_info:
+                            writer.add_scalar("charts/episodic_return", info["episode"]["r"], train_step)
+                            writer.add_scalar("charts/episodic_length", info["episode"]["l"], train_step)
         notend_game = 1 - next_done # whether the game ends
         advantages, returns = GAE(agent, values, rewards, dones, gamma, gae_lambda, notend_game, next_ob)
         # train the network
@@ -193,9 +198,9 @@ def train_ppo(agent, device, run_name, total_timesteps, seed, num_steps, num_env
         torch.save(agent.network.state_dict(), "./model/"+run_name+"/Network.pth")
 
 
-def test(device, env_id, path, episodes):
+def test(device, env_id, path, episodes, render=True, capture_video=False):
     print("--------Start testing-----------")
-    env = wrap_env(env_id, render=True)()
+    env = wrap_env(env_id, path, render=render, capture_video=capture_video)()
     agent = Agent(env).to(device)
     agent.actor.load_state_dict(torch.load("./model/"+path+"/Actor.pth"))
     agent.critic.load_state_dict(torch.load("./model/"+path+"/Critic.pth"))
@@ -217,9 +222,10 @@ def test(device, env_id, path, episodes):
 if __name__ == "__main__":
     seed = 1
     seed_initialization(seed)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     env_id = "PongNoFrameskip-v4"
+
+    # training parameters
     num_envs = 8
     envs = gym.vector.SyncVectorEnv(
         [wrap_env(env_id) for _ in range(num_envs)]
@@ -233,8 +239,8 @@ if __name__ == "__main__":
     minibatches = 4
     learning_rate = 2.5e-4
     train_ppo(agent, device, run_name, total_timesteps, seed, num_steps, num_envs, minibatches, learning_rate,
-              record_info=True, anneal_lr=True)
+              record_info=False, anneal_lr=True)
     
     # test the model
-    # run_name = f"{env_id}_{1}_{today.day}_{10}h{14}m_{total_timesteps}"
-    # test(device, env_id, run_name, 1)
+    # run_name = f"{env_id}_{1}_{24}_{10}h{14}m_{20000000}"
+    # test(device, env_id, run_name, 1, render=False, capture_video=True)
