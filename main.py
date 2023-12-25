@@ -223,7 +223,7 @@ if __name__ == "__main__":
     seed = 1
     seed_initialization(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    env_id = "PongNoFrameskip-v4"
+    env_id = "PongNoFrameskip-v0"
 
     # training parameters
     num_envs = 8
@@ -243,4 +243,5 @@ if __name__ == "__main__":
     
     # test the model
     # run_name = f"{env_id}_{1}_{24}_{10}h{14}m_{20000000}"
+    # run_name = f"{env_id}_{1}_{24}_{16}h{56}m_{50000000}"
     # test(device, env_id, run_name, 1, render=False, capture_video=True)

@@ -1,1 +1,2 @@
-This project is dedicated as the final project of the course PEOCS(2023). We implement the PPO algorithm on the Pong game in the gym environment. 
+# PEOCS Final Project of Group 3
+This project serves as the final project of the course PEOCS-2023. We implement the PPO algorithm on the Pong game in the gym environment. The realization of the PPO algorithm follows the fashion of clearRL. We however build 
